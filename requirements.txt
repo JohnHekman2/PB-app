@@ -1,0 +1,9 @@
+streamlit
+langchain
+langchain-community
+langchain_openai
+chromadb
+pypdf
+sentence-transformers
+markdown
+htmldocx
