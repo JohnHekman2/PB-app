@@ -18,8 +18,8 @@ DOEL_CRS = "EPSG:28992"
 RUIS_WOORDEN = [
     'landgoederen', 'concept', 'natuurdoelanalyse', 'nda', 'ov', 'gelderland', 
     'overijssel', 'utrecht', 'noord', 'zuid', 'holland', 'brabant', 'limburg',
-    'zeeland', 'flevoland', 'groningen', 'friesland', 'drenthe', 'beheerplan',
-    'assessment', 'bijlage', 'definitief', 'versie', 'v1', 'v2', 'v3'
+    'zeeland', 'flevoland', 'groningen', 'friesland', 'drenthe', 'beheerplan','doelenanalyse',
+    'assessment', 'bijlage', 'definitief', 'versie', 'v1', 'v2', 'v3','compressed','natura2000','natura',
 ]
 
 def get_area_name(file_path: str) -> str:
