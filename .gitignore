@@ -17,6 +17,7 @@ supportdata/
 .venv/
 venv/
 env/
+.env
 
 # --- 4. THE WHITELIST (WHAT TO KEEP) ---
 # Un-ignore (Track) all Python script files

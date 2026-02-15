@@ -1,6 +1,5 @@
 import streamlit as st
 import io
-from io import StringIO
 import os
 import tempfile 
 from datetime import datetime
@@ -18,14 +17,16 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
-import markdown
-from htmldocx import HtmlToDocx
 from thefuzz import process
 from thefuzz import fuzz
-from openai import OpenAI # NIEUW: Voor directe API call
+from openai import OpenAI
+
+import markdown
+from htmldocx import HtmlToDocx
+from docx.shared import Inches
 
 # Utility imports
-from utils import RUIS_WOORDEN, generate_csv_from_municipality, PAD_GEMEENTEN
+from utils import RUIS_WOORDEN, generate_csv_from_municipality, get_geodata_for_municipality, create_map_image, PAD_GEMEENTEN
 
 # --- 1. PAGE CONFIGURATION (MUST BE FIRST) ---
 st.set_page_config(page_title="Biodiversity Assessment Batch Analyzer", layout="wide")
@@ -35,8 +36,6 @@ VECTOR_STORE_DIRECTORY = "vector_store"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 try:
-    # Load credentials securely from .streamlit/secrets.toml
-    # We slaan ze ook op in session_state voor de directe OpenAI client
     if "openai_base_url" not in st.session_state:
         st.session_state.openai_base_url = st.secrets["BASE_URL"]
     if "openai_api_key" not in st.session_state:
@@ -82,7 +81,7 @@ Jouw taak is om een gedetailleerde analyse te genereren over de natuurdoelen.
 
 **GEBRUIK DE VOLGENDE INSTRUCTIES OM TE BEPALEN WELKE CATEGORIEN JE MOET ANALYSEREN. ANALYSEER ALLEEN DE CATEGORIEËN DIE IN DE INSTRUCTIES ALS 'AANWEZIG' ZIJN GEMARKEERD.**
 -----------------
-INSTRUCTIES/CHECKLISTt:
+INSTRUCTIES/CHECKLIST:
 {concept_check_result}
 -----------------
 
@@ -105,7 +104,7 @@ Het JSON-object moet de volgende structuur hebben:
 Als er geen gegevens zijn, laat de lijst "bevindingen" leeg.
 """
 
-# Prompt voor Stap 2 (Omgevingsvisie) - Aangepast voor Full Context met 5 categorieën
+# Prompt voor Stap 2 (Omgevingsvisie)
 IMPACT_PROMPT_FULL = """
 Je bent een expert in ruimtelijke ordening en ecologie.
 Hieronder volgt de volledige tekst van een Omgevingsvisie (of beleidsdocument).
@@ -119,12 +118,15 @@ Analyseer het document grondig op concrete ingrepen, ambities of ontwikkelingen 
 4. **Landbouwmaatregelen:** (Implicaties: verplaatsing/intensivering/extensivering kan leiden tot verschuivingen in stikstofdepositie)
 5. **Bedrijvigheid:** (Implicaties: extra verkeersbewegingen, ruimtegebruik nieuwe terreinen)
 
-**OUTPUT FORMAAT:**
+**OUTPUT FORMAAT & RESTRICTIES:**
 Genereer voor ELK van deze 5 categorieën een samenvattende tekst.
 - Gebruik de categorie als tussenkop (bijv. "### 1. Woningbouw").
 - Beschrijf concreet wat er in het plan staat (aantallen, locaties, specifieke projecten).
 - Benoem expliciet de potentiële risico's voor de natuur zoals hierboven beschreven.
 - Citeer waar mogelijk paginanummers of paragraafnamen.
+- Maak gebruik van bullet points voor de opsommingen binnen een categorie.
+
+**BELANGRIJK:** Sluit de analyse direct af na de 5e categorie. Geef GEEN suggesties voor verdere analyses, stel GEEN wedervragen en bied GEEN extra hulp aan. De output wordt gebruikt in een statisch rapport zonder mogelijkheid tot interactie.
 
 Als er voor een categorie GEEN maatregelen worden genoemd, geef dit dan expliciet aan met "Geen relevante ingrepen gevonden in dit document."
 
@@ -151,23 +153,16 @@ def get_custom_llm():
     return ChatOpenAI(
         model="gpt-5-mini",
         api_key=YOUR_API_KEY,
-        base_url=YOUR_API_BASE_URL
+        base_url=YOUR_API_BASE_URL,
+        temperature=0.2
     )
 
-# NIEUW: Directe OpenAI Client voor Full Context Analysis
 @st.cache_resource
 def get_openai_client():
-    """
-    Maakt en cachet een OpenAI client-instantie.
-    Haalt de credentials op uit st.session_state, die worden geinitialiseerd
-    via st.secrets.
-    """
     api_key = st.session_state.get('openai_api_key')
     base_url = st.session_state.get('openai_base_url')
     
-    # Zorg ervoor dat de base_url eindigt op /v1 als dat nodig is voor de API
     if base_url and not base_url.endswith("/v1"):
-         # Dit is een heuristiek, de uiteindelijke implementatie hangt af van de AI-proxy
         base_url = base_url.rstrip('/') + '/v1' 
         
     if api_key and base_url:
@@ -196,10 +191,70 @@ def load_gemeenten():
         print(f"Error loading gemeenten: {e}")
         return []
 
+# --- MOCK DATA FUNCTIES (DEV MODE) ---
+def get_mock_natuur_data(selected_areas):
+    """Geeft instant dummy data terug voor UI testing."""
+    import time
+    time.sleep(0.5) # Simuleer een heel klein beetje laadtijd
+    
+    results = {}
+    mock_json = {
+        "bevindingen": [
+            {"categorie": "Habitattype", "natuurtype": "H3150 Meren", "kwaliteit": "Matig", "knelpunten": "Stikstof", "oordeel": "Ja"},
+            {"categorie": "Broedvogels", "natuurtype": "Roerdomp", "kwaliteit": "Slecht", "knelpunten": "Verdroging", "oordeel": "Nee, niet haalbaar"},
+            {"categorie": "Habitatrichtlijnsoorten", "natuurtype": "Kamsalamander", "kwaliteit": "Onbekend", "knelpunten": "Versnippering", "oordeel": "Nee, gebrek aan gegevens"}
+        ],
+        "samenvatting": "Dit is een door de ontwikkelaarsmodus gegenereerde samenvatting. De kwaliteit van de meren staat onder druk door stikstof, en voor de kamsalamander ontbreken momenteel de gegevens."
+    }
+    
+    for area in selected_areas:
+        markdown_str = format_json_to_markdown(mock_json)
+        results[area] = {
+            'summary': markdown_str,
+            'sources': ['mock_beheerplan_2024.pdf', 'mock_bijlage_kaarten.pdf'],
+            'raw_data': mock_json
+        }
+    return results
+
+def get_mock_impact_data():
+    """Geeft instant dummy data terug voor de Omgevingsvisie UI testing."""
+    return """### 1. Woningbouw
+- Geplande bouw van 1500 woningen in de wijk 'Nieuw-Noord' (pag. 12).
+- **Risico's:** Ruimtegebruik grenzend aan Natura 2000, extra stikstofemissie tijdens de bouwfase, en verhoogde recreatiedruk in omliggende bossen door nieuwe bewoners.
+
+### 2. Recreatie Ontwikkeling
+- Aanleg van nieuwe fietspaden en een bezoekerscentrum aan de rand van het plassengebied (pag. 45).
+- **Risico's:** Verstoring van broedvogels door toename van dagjesmensen en geluid.
+
+### 3. Mobiliteit & Infrastructuur
+- Verbreding van de N-weg om nieuwe wijken te ontsluiten (pag. 50).
+- **Risico's:** Extra verkeersbewegingen leiden tot hogere stikstofdepositie. Barrièrewerking (versnippering) voor grondgebonden soorten zoals dassen.
+
+### 4. Landbouwmaatregelen
+- Geen relevante ingrepen gevonden in dit document.
+
+### 5. Bedrijvigheid
+- Uitbreiding van lokaal bedrijventerrein 'De Haven' met 5 hectare (pag. 60).
+- **Risico's:** Extra vrachtverkeer resulteert in stikstofuitstoot, en licht/geluidsverstoring in de nachtelijke uren voor nabijgelegen natuur."""
+
 # --- 5. LOGIC HELPER FUNCTIONS (Matching, Processing, Conversion) ---
 
+def load_introduction_from_docx(file_path):
+    """Leest tekst uit een .docx bestand voor de inleiding."""
+    if not os.path.exists(file_path):
+        return None
+    try:
+        import docx
+        doc = docx.Document(file_path)
+        full_text = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                full_text.append(para.text)
+        return "\n\n".join(full_text)
+    except Exception as e:
+        return f"*(Fout bij laden inleiding uit {file_path}: {e})*"
+
 def calculate_dynamic_stopwords(all_names: list, frequency_threshold: float = 0.05):
-    """Berekent welke woorden te vaak voorkomen in de dataset."""
     word_counter = Counter()
     total_docs = len(all_names)
     if total_docs == 0: return set()
@@ -217,7 +272,6 @@ def calculate_dynamic_stopwords(all_names: list, frequency_threshold: float = 0.
     return dynamic_noise
 
 def clean_area_name_for_matching(name: str, dynamic_stopwords: set = None) -> str:
-    """Maakt namen schoon met statische én dynamische stopwoorden."""
     clean_name = name.lower()
     clean_name = re.sub(r'[^a-z0-9\s]+', ' ', clean_name)
     words = clean_name.split()
@@ -228,27 +282,28 @@ def clean_area_name_for_matching(name: str, dynamic_stopwords: set = None) -> st
     clean_name = ' '.join(filtered_words)
     return re.sub(r'\s+', ' ', clean_name).strip()
 
-def convert_markdown_to_docx_bytes(markdown_string: str) -> io.BytesIO:
-    """Converteert Markdown string naar een Word document buffer."""
-    # Zorg dat de tabellen extensie aanstaat
-    html = markdown.markdown(markdown_string, extensions=['tables'])
-    buffer = io.BytesIO()
-    parser = HtmlToDocx()
-    doc = parser.parse_html_string(html)
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer
-
 def parse_json_response(response_text: str):
     try:
         cleaned_text = re.sub(r'```json\s*', '', response_text)
         cleaned_text = re.sub(r'```\s*$', '', cleaned_text)
+        
+        # Zoek specifiek naar het JSON object (tussen accolades) om intro/outro tekst te negeren
+        match = re.search(r'(\{.*\})', cleaned_text, re.DOTALL)
+        if match:
+            cleaned_text = match.group(1)
+            
         cleaned_text = cleaned_text.strip()
-        data = json.loads(cleaned_text)
+        # strict=False helpt bij newlines in strings die LLMs vaak genereren
+        data = json.loads(cleaned_text, strict=False)
         return data
     except json.JSONDecodeError as e:
         print(f"JSON Parse Error: {e}")
-        return None
+        try:
+            import ast
+            # Fallback: ast.literal_eval is vergevingsgezinder (bv. single quotes of trailing commas)
+            return ast.literal_eval(cleaned_text)
+        except Exception:
+            return None
 
 def format_json_to_markdown(json_data):
     if not json_data:
@@ -269,6 +324,47 @@ def format_json_to_markdown(json_data):
     if summary:
         markdown_output += f"**Samenvatting:**\n{summary}"
     return markdown_output
+
+def flatten_results_to_df(results_dict):
+    rows = []
+    for area, data in results_dict.items():
+        raw = data.get('raw_data')
+        if raw and 'bevindingen' in raw:
+            for item in raw['bevindingen']:
+                rows.append({
+                    'Gebied': area,
+                    'Categorie': item.get('categorie', 'Onbekend'),
+                    'Oordeel': item.get('oordeel', 'Onbekend'),
+                    'Soort': item.get('natuurtype', 'Onbekend')
+                })
+    return pd.DataFrame(rows)
+
+def convert_markdown_to_docx_bytes(markdown_string: str, map_image_buffer: io.BytesIO = None) -> io.BytesIO:
+    """Converteert Markdown string naar een Word document buffer en voegt een kaart toe."""
+    parser = HtmlToDocx()
+    
+    # Maak een nieuw document of parse een lege string om een doc object te krijgen
+    doc = parser.parse_html_string("") 
+    
+    # Voeg de kaart toe als die er is
+    if map_image_buffer:
+        try:
+            map_image_buffer.seek(0)
+            doc.add_heading("Kaartoverzicht", level=1)
+            doc.add_picture(map_image_buffer, width=Inches(6.0))
+            doc.add_page_break()
+        except Exception as e:
+            print(f"Fout bij toevoegen kaart aan DOCX: {e}")
+
+    # Converteer de rest van de markdown en voeg het toe
+    html = markdown.markdown(markdown_string, extensions=['tables'])
+    parser.add_html_to_document(html, doc) # Voeg de html toe aan het bestaande document
+
+    # Sla op in buffer
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
 
 def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: str = 'naam_n2k', threshold: int = 60):
     dynamic_stopwords = calculate_dynamic_stopwords(all_available_areas, frequency_threshold=0.05)
@@ -296,7 +392,6 @@ def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: 
     successful_matches_detail = []
     debug_info = []
     
-    # Pre-clean index
     indexed_map = {}
     for full_name in all_available_areas:
         clean_key = clean_area_name_for_matching(full_name, dynamic_stopwords)
@@ -325,50 +420,26 @@ def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: 
 
     return successful_matches_detail, sorted(list(areas_to_analyze_indexed)), debug_info
 
-# --- NIEUW: Hulpfunctie voor Statistieken Aggregatie ---
-def flatten_results_to_df(results_dict):
-    """Zet de geneste resultaten-dictionary om naar een vlak DataFrame voor analyse."""
-    rows = []
-    for area, data in results_dict.items():
-        raw = data.get('raw_data')
-        if raw and 'bevindingen' in raw:
-            for item in raw['bevindingen']:
-                rows.append({
-                    'Gebied': area,
-                    'Categorie': item.get('categorie', 'Onbekend'),
-                    'Oordeel': item.get('oordeel', 'Onbekend'),
-                    'Soort': item.get('natuurtype', 'Onbekend')
-                })
-    return pd.DataFrame(rows)
 
-# --- AANGEPAST: Full Context Analyse met Directe OpenAI Client ---
 def analyze_local_pdf(uploaded_file, client):
-    """
-    Laadt PDF, extraheert ALLE tekst en stuurt deze naar OpenAI (Full Context).
-    """
-    # 1. Tijdelijk opslaan (PyPDFLoader werkt met file paths)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
         tmp_path = tmp_file.name
 
     try:
-        # 2. Extract Text (Full Document)
         loader = PyPDFLoader(tmp_path)
         documents = loader.load()
-        
-        # Voeg alle pagina's samen tot één grote string
         full_text = "\n\n".join([doc.page_content for doc in documents])
         
-        # 3. Directe API Call naar OpenAI (gpt-5-mini)
         prompt_content = IMPACT_PROMPT_FULL.format(context=full_text)
         
         response = client.chat.completions.create(
-            model="gpt-5-mini", # Gebruik modelnaam uit je config
+            model="gpt-5-mini", 
             messages=[
                 {"role": "system", "content": "Je bent een expert in ruimtelijke ordening en ecologie."},
                 {"role": "user", "content": prompt_content}
             ],
-            temperature=1
+            temperature=1 
         )
         
         return response.choices[0].message.content
@@ -376,7 +447,6 @@ def analyze_local_pdf(uploaded_file, client):
     except Exception as e:
         return f"Fout bij analyseren Omgevingsvisie: {e}"
     finally:
-        # Opruimen
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
@@ -429,7 +499,6 @@ def run_batch_analysis(vector_store, llm, selected_areas, concept_check_prompt, 
             json_data = parse_json_response(json_response_text)
             if json_data:
                 formatted_markdown = format_json_to_markdown(json_data)
-                # NIEUW: Sla ook de ruwe JSON data op in de resultaten
                 results[area] = {'summary': formatted_markdown, 'sources': unique_sources, 'raw_data': json_data}
             else:
                 results[area] = {'summary': f"**Fout:** Geen valide JSON.\nOutput: {json_response_text}", 'sources': unique_sources, 'raw_data': None}
@@ -446,7 +515,7 @@ st.markdown("Stap 1: Analyseer Natura 2000 doelen. Stap 2: Analyseer impact vanu
 try:
     vector_store = get_vector_store()
     llm = get_custom_llm()
-    openai_client = get_openai_client() # NIEUW: Laad client
+    openai_client = get_openai_client()
     all_areas = get_all_area_names()
 except Exception as e:
     st.error(f"Fout bij initialisatie: {e}")
@@ -454,8 +523,8 @@ except Exception as e:
 
 # Initialize Session State
 for key in ['csv_file_buffer', 'areas_to_analyze', 'locked_areas_to_analyze', 'successful_matches_detail', 'debug_info', 'analysis_results', 'dynamic_stopwords_used', 
-            'natuur_analysis_md', 'impact_analysis_md', 'final_report_md']: # NIEUWE keys voor rapporten
-    if key not in st.session_state: st.session_state[key] = None if 'results' in key else []
+            'natuur_analysis_md', 'impact_analysis_md', 'final_report_md', 'map_image_buffer']:
+    if key not in st.session_state: st.session_state[key] = None if 'results' in key or 'buffer' in key else []
 if 'matching_complete' not in st.session_state: st.session_state.matching_complete = False
 if 'analysis_running' not in st.session_state: st.session_state.analysis_running = False
 
@@ -468,16 +537,35 @@ with tab1:
     gemeente_input = st.selectbox("Selecteer een Gemeente:", options=available_gemeenten, index=None, placeholder="Typ...", key='gemeente_selectbox')
     if st.button("Genereer & Match Documenten"):
         if gemeente_input:
-            buffer, message = generate_csv_from_municipality(gemeente_input)
-            st.session_state.csv_file_buffer = buffer
-            if buffer:
-                st.success(f"CSV gegenereerd voor '{gemeente_input}'")
-                matches, areas, debug = match_areas_from_csv(buffer, all_areas)
+            # Vorige kaart en selectie wissen
+            st.session_state.map_image_buffer = None
+            
+            message, gemeente_gdf, gebieden_gdf = get_geodata_for_municipality(gemeente_input)
+
+            if gebieden_gdf is not None and not gebieden_gdf.empty:
+                st.success(f"Analyse geslaagd: {len(gebieden_gdf)} gebieden gevonden voor '{gemeente_input}'.")
+
+                # 1. Genereer en bewaar de kaart
+                with st.spinner("Kaart genereren..."):
+                    map_buffer = create_map_image(gemeente_gdf, gebieden_gdf, gemeente_input)
+                    st.session_state.map_image_buffer = map_buffer
+
+                # 2. Genereer CSV voor matching-proces
+                gebieden_gdf['afstand_km'] = gebieden_gdf['kortste_afstand_m'] / 1000.0
+                csv_df = gebieden_gdf[['naam_n2k', 'afstand_km']]
+                csv_buffer = io.BytesIO()
+                csv_df.to_csv(csv_buffer, index=False)
+                csv_buffer.seek(0)
+                st.session_state.csv_file_buffer = csv_buffer
+                
+                # 3. Match gebieden
+                matches, areas, debug = match_areas_from_csv(io.BytesIO(csv_buffer.getvalue()), all_areas)
                 st.session_state.successful_matches_detail = matches
                 st.session_state.areas_to_analyze = areas
                 st.session_state.debug_info = debug
                 st.session_state.locked_areas_to_analyze = list(areas)
                 st.session_state.matching_complete = True
+                st.session_state.manual_selection = areas
                 st.rerun()
             else:
                 st.warning(message)
@@ -488,19 +576,26 @@ with tab2:
     st.subheader("Upload CSV")
     uploaded_file = st.file_uploader("Upload CSV met 'naam_n2k' kolom", type=['csv'])
     if uploaded_file:
+        # Wis de kaart als er een nieuwe upload is
+        st.session_state.map_image_buffer = None
         matches, areas, debug = match_areas_from_csv(uploaded_file, all_areas)
         st.session_state.successful_matches_detail = matches
         st.session_state.areas_to_analyze = areas
         st.session_state.debug_info = debug
         st.session_state.locked_areas_to_analyze = list(areas)
         st.session_state.matching_complete = True
+        st.session_state.manual_selection = areas
         st.success(f"CSV geladen! {len(areas)} documenten.")
         st.rerun()
 
 with tab3:
     st.subheader("Handmatig")
     manual_selection = st.multiselect("Selecteer gebieden:", options=all_areas, default=st.session_state.areas_to_analyze, key='manual_selection')
+    # Wis de kaart als handmatige selectie wordt aangepast
+    if set(manual_selection) != set(st.session_state.areas_to_analyze):
+        st.session_state.map_image_buffer = None
     st.session_state.areas_to_analyze = manual_selection
+
 
 areas = st.session_state.areas_to_analyze
 matches = st.session_state.successful_matches_detail
@@ -533,9 +628,21 @@ if areas:
 
 st.info(f"Geselecteerde documenten: **{len(areas)}**")
 
+if st.session_state.get('map_image_buffer'):
+    st.subheader("Kaartoverzicht")
+    st.session_state.map_image_buffer.seek(0)
+    st.image(st.session_state.map_image_buffer, caption="Geselecteerde gemeente en nabijgelegen natuurgebieden.")
+    st.markdown("---")
+
+# --- DEV MODE TOGGLE ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔧 Development Tools")
+# Deze checkbox activeert de mock data
+dev_mode = st.sidebar.checkbox("🛠️ Ontwikkelaarsmodus (Snel testen zonder AI)", value=False)
+
+
 # --- EXECUTION FLOW ---
 
-# STAP 1: NATUURDOEL ANALYSE
 st.header("Stap 1: Natura 2000 Doelen Analyse")
 
 if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
@@ -545,13 +652,26 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
     else:
         st.session_state.analysis_running = True
         try:
-            results = run_batch_analysis(vector_store, llm, target_areas, CONCEPT_CHECK_PROMPT, TABLE_GENERATION_PROMPT, SYSTEM_TEMPLATE)
+            # Check of we in Dev Mode zitten
+            if dev_mode:
+                st.toast("Gebruik makend van Mock Data!", icon="🛠️")
+                results = get_mock_natuur_data(target_areas)
+            else:
+                results = run_batch_analysis(vector_store, llm, target_areas, CONCEPT_CHECK_PROMPT, TABLE_GENERATION_PROMPT, SYSTEM_TEMPLATE)
+            
             st.session_state.analysis_results = results
             
-            # Genereren van initieel rapport
             if results:
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Inleiding laden uit docx
+                intro_path = os.path.join("rapport_tekst", "INLEIDING.docx")
+                intro_text = load_introduction_from_docx(intro_path)
+                
                 md_out = f"# Natuurdoel & Omgevings Impact Rapport\n**Datum:** {now}\n\n"
+                if intro_text:
+                    md_out += f"{intro_text}\n\n---\n\n"
+                
                 md_out += "# DEEL 1: Natura 2000 Analyse\n\n"
                 for area, data in results.items():
                     md_out += f"## {area}\n\n{data['summary']}\n\n"
@@ -559,7 +679,7 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
                     md_out += "\n---\n\n"
                 
                 st.session_state.natuur_analysis_md = md_out
-                st.session_state.final_report_md = md_out # Voorlopig eindresultaat
+                st.session_state.final_report_md = md_out 
                 st.success("Stap 1 Voltooid!")
                 st.rerun()
         except Exception as e:
@@ -567,39 +687,43 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
         finally:
             st.session_state.analysis_running = False
 
-# TOON RESULTATEN STAP 1
 if st.session_state.analysis_results:
     with st.expander("Bekijk resultaten Stap 1", expanded=False):
         st.markdown(st.session_state.natuur_analysis_md)
 
-    # --- STAP 2: OMGEVINGSVISIE UPLOAD (AANGEPAST) ---
     st.markdown("---")
     st.header("Stap 2: Omgevingsvisie Impact Analyse (Optioneel)")
-    st.markdown("Upload de Omgevingsvisie (PDF) om te controleren op ingrepen die de geselecteerde natuurgebieden kunnen raken. **(Full Context Analyse)**")
+    st.markdown("Upload de Omgevingsvisie (PDF) om te controleren op ingrepen die de geselecteerde natuurgebieden kunnen raken.")
 
     omgevings_pdf = st.file_uploader("Upload Omgevingsvisie PDF", type="pdf", key="omgevingsvisie_uploader")
 
-    if omgevings_pdf and st.button("▶️ Start Stap 2 (Impact Analyse)"):
-        if not openai_client:
+    # Als DEV MODE aanstaat, sta toe dat we Stap 2 draaien zónder een PDF te hoeven uploaden
+    can_run_step_2 = (omgevings_pdf is not None) or dev_mode
+
+    if can_run_step_2 and st.button("▶️ Start Stap 2 (Impact Analyse)"):
+        if not openai_client and not dev_mode:
             st.error("Kon OpenAI client niet laden. Controleer je secrets.")
         else:
             with st.spinner("Bezig met analyseren van volledige Omgevingsvisie..."):
-                # AANROEP NIEUWE FUNCTIE (MET DIRECTE CLIENT)
-                impact_result = analyze_local_pdf(omgevings_pdf, openai_client)
                 
-                # Markdown opbouwen voor deel 2
+                # Check of we in Dev Mode zitten
+                if dev_mode:
+                    impact_result = get_mock_impact_data()
+                    bestandsnaam = "mock_omgevingsvisie_2024.pdf"
+                else:
+                    impact_result = analyze_local_pdf(omgevings_pdf, openai_client)
+                    bestandsnaam = omgevings_pdf.name
+                
                 impact_md = "\n# DEEL 2: Impact Analyse uit Omgevingsvisie\n\n"
-                impact_md += f"**Geanalyseerd bestand:** {omgevings_pdf.name}\n\n"
+                impact_md += f"**Geanalyseerd bestand:** {bestandsnaam}\n\n"
                 impact_md += impact_result
                 
                 st.session_state.impact_analysis_md = impact_md
                 
-                # Samenvoegen rapporten
                 st.session_state.final_report_md = st.session_state.natuur_analysis_md + "\n\n---\n\n" + impact_md
                 st.success("Stap 2 Voltooid! Rapport bijgewerkt.")
                 st.rerun()
 
-    # TOON RESULTATEN STAP 2
     if st.session_state.impact_analysis_md:
         with st.expander("Bekijk resultaten Stap 2", expanded=True):
             st.markdown(st.session_state.impact_analysis_md)
@@ -614,9 +738,10 @@ if st.session_state.final_report_md:
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     c1, c2 = st.columns(2)
     c1.download_button("⬇️ Download Volledig Rapport (.md)", st.session_state.final_report_md, f"rapport_compleet_{timestamp}.md")
-    c2.download_button("⬇️ Download Volledig Rapport (.docx)", convert_markdown_to_docx_bytes(st.session_state.final_report_md), f"rapport_compleet_{timestamp}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    
+    docx_data = convert_markdown_to_docx_bytes(st.session_state.final_report_md, st.session_state.get('map_image_buffer'))
+    c2.download_button("⬇️ Download Volledig Rapport (.docx)", docx_data, f"rapport_compleet_{timestamp}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-# KWANTITATIEVE STATISTIEKEN (Alleen voor Stap 1 data)
 if st.session_state.analysis_results:
     df_stats = flatten_results_to_df(st.session_state.analysis_results)
     if not df_stats.empty:
