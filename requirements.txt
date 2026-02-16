@@ -19,3 +19,4 @@ python-levenshtein
 markdown2docx
 python-docx
 htmldocx
+pytest
