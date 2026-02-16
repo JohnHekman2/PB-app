@@ -1,7 +1,9 @@
 streamlit
+streamlit-folium
 pandas
 geopandas
 shapely
+folium
 langchain
 langchain-core>=0.3.81
 langchain-chroma
@@ -19,4 +21,3 @@ python-levenshtein
 markdown2docx
 python-docx
 htmldocx
-pytest
