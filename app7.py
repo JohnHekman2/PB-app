@@ -8,6 +8,7 @@ import re
 import json
 from collections import Counter
 import concurrent.futures
+import sys
 
 # Third-party imports
 from langchain_chroma import Chroma
@@ -29,8 +30,9 @@ from docx.shared import Inches
 # Utility imports
 from utils import RUIS_WOORDEN, generate_csv_from_municipality, get_geodata_for_municipality, create_map_image, PAD_GEMEENTEN
 
+
 # --- 1. PAGE CONFIGURATION (MUST BE FIRST) ---
-st.set_page_config(page_title="Biodiversity Assessment Batch Analyzer", layout="wide")
+st.set_page_config(page_title="Passende beoordeling voor omgevingsvisies", layout="wide")
 
 # --- 2. CONFIGURATION & SECRETS ---
 VECTOR_STORE_DIRECTORY = "vector_store"
@@ -155,7 +157,7 @@ def get_custom_llm():
         model="gpt-5-mini",
         api_key=YOUR_API_KEY,
         base_url=YOUR_API_BASE_URL,
-        temperature=0.2
+        temperature=1
     )
 
 @st.cache_resource
@@ -292,8 +294,18 @@ def parse_json_response(response_text: str):
         match = re.search(r'(\{.*\})', cleaned_text, re.DOTALL)
         if match:
             cleaned_text = match.group(1)
+        else:
+            # Fallback: als regex faalt (bv. door ontbrekende sluit-accolade bij afkapping)
+            start_idx = cleaned_text.find('{')
+            if start_idx != -1:
+                cleaned_text = cleaned_text[start_idx:]
             
         cleaned_text = cleaned_text.strip()
+            
+        # Reparatie voor afgekapte output (missing closing brace)
+        if not cleaned_text.endswith('}'):
+            cleaned_text += '}'
+
         # strict=False helpt bij newlines in strings die LLMs vaak genereren
         data = json.loads(cleaned_text, strict=False)
         return data
@@ -631,7 +643,15 @@ def run_batch_analysis(vector_store, llm, selected_areas, concept_check_prompt, 
 
 # --- 7. MAIN APP INTERFACE ---
 
-st.title("🌱 Batch Analyzer: Natuurdoel & Omgeving")
+# --- Service Definition Class ---
+# This makes the dependency explicit and clean
+class AnalysisServices:
+    def __init__(self, run_batch_analysis_func, analyze_local_pdf_func, get_pdf_name_func):
+        self.run_batch_analysis = run_batch_analysis_func
+        self.analyze_local_pdf = analyze_local_pdf_func
+        self.get_pdf_name = get_pdf_name_func
+
+st.title("🌱 Passende Beoordeling voor Omgevingsvisies en programma's")
 st.markdown("Stap 1: Analyseer Natura 2000 doelen. Stap 2: Analyseer impact vanuit Omgevingsvisie.")
 
 try:
@@ -759,9 +779,50 @@ if st.session_state.get('map_image_buffer'):
 # --- DEV MODE TOGGLE ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔧 Development Tools")
-# Deze checkbox activeert de mock data
-dev_mode = st.sidebar.checkbox("🛠️ Ontwikkelaarsmodus (Snel testen zonder AI)", value=False)
 
+# Een enkele schakelaar voor dev mode. De standaardwaarde wordt bepaald door een omgevingsvariabele.
+# Dit is een gebruikelijk patroon voor CI/CD of lokale tests.
+# Start met: DEV_MODE=true streamlit run app7.py
+
+# Check eerst OS environment variable, daarna secrets.toml
+is_dev_env = os.getenv("DEV_MODE", "false").lower() == "true"
+if not is_dev_env:
+    # Fallback naar secrets.toml als env var niet is gezet
+    is_dev_env = str(st.secrets.get("DEV_MODE", "false")).lower() == "true"
+
+dev_mode_active = st.sidebar.checkbox(
+    "🛠️ Ontwikkelaarsmodus (gebruik mock data)",
+    value=is_dev_env
+)
+
+# --- Service Injection ---
+# Op basis van de schakelaar "injecteren" we de echte of de mock services.
+if dev_mode_active:
+    st.sidebar.info("Dev modus is actief.")
+    
+    # Creëer mock services die voldoen aan de verwachte interface
+    def mock_natuur_analyzer(selected_areas, **kwargs):
+        st.toast("Gebruik makend van Mock Data voor Stap 1!", icon="🛠️")
+        return get_mock_natuur_data(selected_areas)
+
+    def mock_impact_analyzer(uploaded_file, **kwargs):
+        return get_mock_impact_data()
+        
+    def get_mock_filename(uploaded_file):
+        return "mock_omgevingsvisie_2024.pdf"
+
+    services = AnalysisServices(
+        run_batch_analysis_func=mock_natuur_analyzer,
+        analyze_local_pdf_func=mock_impact_analyzer,
+        get_pdf_name_func=get_mock_filename
+    )
+else:
+    # Echte services
+    services = AnalysisServices(
+        run_batch_analysis_func=run_batch_analysis,
+        analyze_local_pdf_func=analyze_local_pdf,
+        get_pdf_name_func=lambda pdf: pdf.name if pdf else ""
+    )
 
 # --- EXECUTION FLOW ---
 
@@ -774,13 +835,17 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
     else:
         st.session_state.analysis_running = True
         try:
-            # Check of we in Dev Mode zitten
-            if dev_mode:
-                st.toast("Gebruik makend van Mock Data!", icon="🛠️")
-                results = get_mock_natuur_data(target_areas)
-            else:
-                results = run_batch_analysis(vector_store, llm, target_areas, CONCEPT_CHECK_PROMPT, TABLE_GENERATION_PROMPT, SYSTEM_TEMPLATE)
-            
+            # De code hoeft niet meer te weten of het in dev-modus is.
+            # Het roept simpelweg de geïnjecteerde service aan.
+            results = services.run_batch_analysis(
+                vector_store=vector_store, 
+                llm=llm, 
+                selected_areas=target_areas, 
+                concept_check_prompt=CONCEPT_CHECK_PROMPT, 
+                table_generation_prompt=TABLE_GENERATION_PROMPT, 
+                system_template=SYSTEM_TEMPLATE
+            )
+
             st.session_state.analysis_results = results
             
             if results:
@@ -820,26 +885,24 @@ if st.session_state.analysis_results:
     omgevings_pdf = st.file_uploader("Upload Omgevingsvisie PDF", type="pdf", key="omgevingsvisie_uploader")
 
     # Als DEV MODE aanstaat, sta toe dat we Stap 2 draaien zónder een PDF te hoeven uploaden
-    can_run_step_2 = (omgevings_pdf is not None) or dev_mode
+    can_run_step_2 = (omgevings_pdf is not None) or dev_mode_active
 
     if can_run_step_2 and st.button("▶️ Start Stap 2 (Impact Analyse)"):
-        if not openai_client and not dev_mode:
+        if not openai_client and not dev_mode_active:
             st.error("Kon OpenAI client niet laden. Controleer je secrets.")
         else:
             with st.spinner("Bezig met analyseren van volledige Omgevingsvisie..."):
-                
-                # Check of we in Dev Mode zitten
-                if dev_mode:
-                    impact_result = get_mock_impact_data()
-                    bestandsnaam = "mock_omgevingsvisie_2024.pdf"
-                else:
-                    impact_result = analyze_local_pdf(omgevings_pdf, openai_client)
-                    bestandsnaam = omgevings_pdf.name
-                
+                # Roep de juiste service aan (echt of mock)
+                impact_result = services.analyze_local_pdf(
+                    uploaded_file=omgevings_pdf, 
+                    client=openai_client
+                )
+                bestandsnaam = services.get_pdf_name(omgevings_pdf)
+
                 impact_md = "\n# DEEL 2: Impact Analyse uit Omgevingsvisie\n\n"
                 impact_md += f"**Geanalyseerd bestand:** {bestandsnaam}\n\n"
                 impact_md += impact_result
-                
+
                 st.session_state.impact_analysis_md = impact_md
                 
                 st.session_state.final_report_md = st.session_state.natuur_analysis_md + "\n\n---\n\n" + impact_md
