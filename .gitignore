@@ -1,22 +1,18 @@
 # --- 1. GLOBAL IGNORE ---
-# Ignore everything in the project by default
-*
 
 # --- 2. TRAVERSAL ---
 # Un-ignore directories so Git can look inside them to find .py files
 !*/
 
 # --- 3. EXPLICIT BLOCKS (SAFETY) ---
-# Even though we are ignoring *, explicitly block these folders 
+# Explicitly block these folders 
 # to ensure no traversal happens and no accidents occur.
 __pycache__/
 .streamlit/
 vector_store/
-data/
-supportdata/
 .venv/
+.vscode/
 venv/
-env/
 .env
 
 # --- 4. THE WHITELIST (WHAT TO KEEP) ---

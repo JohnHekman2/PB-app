@@ -1,0 +1,23 @@
+{
+    "name": "PB-app Dev Container",
+    "image": "mcr.microsoft.com/devcontainers/python:3.11",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance"
+            ]
+        }
+    },
+    "postCreateCommand": "pip3 install --user -r requirements.txt",
+    "remoteUser": "vscode",
+    "portsAttributes": {
+        "8501": {
+            "label": "Streamlit",
+            "onAutoForward": "openPreview"
+        }
+    },
+    "forwardPorts": [
+        8501
+    ]
+}

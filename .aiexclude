@@ -1,0 +1,32 @@
+# Ignore dependency directories
+node_modules/
+venv/
+.venv/
+env/
+
+# Ignore large data and binary folders
+data/
+old_versions/
+rapport_tekst/
+supportdata/
+vector_store/
+.streamlit/
+agent_scripts/
+
+*.csv
+*.jsonl
+*.parquet
+*.sql
+*.log
+
+# Ignore build outputs and caches
+dist/
+build/
+.cache/
+.pytest_cache/
+__pycache__/
+
+# Ignore specific heavy media
+assets/
+videos/
+images/
