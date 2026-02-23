@@ -137,6 +137,38 @@ TEKST VAN DOCUMENT:
 {context}
 """
 
+# NIEUW: Prompt voor Stap 3 (Conclusies - alleen op basis van impact)
+CONCLUSION_PROMPT_TEMPLATE = """
+Je bent een expert in ecologie en ruimtelijke ordening.
+Je taak is om een concluderende paragraaf te schrijven over een specifiek onderwerp, gebaseerd op de impactanalyse van een omgevingsvisie.
+
+**ONDERWERP:** {topic}
+
+**ANALYSE IMPACT OMGEVINGSVISIE**
+Hieronder staat de analyse van de ingrepen uit de omgevingsvisie.
+---
+{impact_analyse}
+---
+
+**JOUW OPDRACHT:**
+Schrijf een beknopte, concluderende paragraaf over het opgegeven **ONDERWERP**. 
+Focus op de relatie tussen de vijf impact categorieën en de mogelijke effecten op **ONDERWERP**.
+
+Schrijf 1 paragraaf over hoe de impacts uit de vijf categoriëen kunnen leiden tot een verslechtering in de staat van **ONDERWERP**. 
+Bijvoorbeeld, een verslechtering in onderwerp 'stikstofdepositie' betekent een toename van de stikstofdepositie, 
+een verslechtering in het onderwerp 'verstoring' betekent een toename van verstoring. Onderbouw wel altijd, met informatie uit de impactanalyse, waarom
+je deze conclusie maakt. 
+
+Schrijf ook 1 paragraaf over hoe de impacts uit de vijf categoriëen kunnen leiden tot een verbetering in de staat van **ONDERWERP**.
+Bijvoorbeeld, een verbetering in het onderwerp 'stikstofdepositie' betekent een afname van de stikstofdepositie, of
+een verbetering in het onderwerp 'verstoring' betekent een afname van de verstoring. Onderbouw wel altijd, met informatie uit de impactanalyse, waarom
+je deze conclusie maakt. 
+
+Eindig je analyse met een paragraaf getiteld 'Conclusie en mitigatie'. 
+Geef daarin in een paar zinnen de algemene conclusie (overzicht van verslechteringen en verbeteringen), en hoe effecten gemitigeerd kunnen worden.
+
+"""
+
 # --- 4. CACHED HELPER FUNCTIONS (Models & Data) ---
 
 @st.cache_resource
@@ -552,6 +584,30 @@ def analyze_local_pdf(uploaded_file, client):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+# --- NIEUW: Functie voor het genereren van een conclusieparagraaf ---
+def generate_conclusion_paragraph(topic: str, impact_analyse: str, client) -> str:
+    """Genereert een enkele conclusieparagraaf voor een specifiek onderwerp op basis van impactanalyse."""
+    if not client:
+        return f"*(Fout: OpenAI client niet beschikbaar voor onderwerp '{topic}')*"
+    
+    prompt_content = CONCLUSION_PROMPT_TEMPLATE.format(
+        topic=topic,
+        impact_analyse=impact_analyse
+    )
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": "Je bent een expert in ecologie en ruimtelijke ordening."},
+                {"role": "user", "content": prompt_content}
+            ],
+            temperature=1 
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"*(Fout bij het genereren van conclusie voor '{topic}': {e})*"
+
 
 # --- 6. RAG CHAIN FUNCTIONS ---
 
@@ -665,13 +721,14 @@ except Exception as e:
 
 # Initialize Session State
 for key in ['csv_file_buffer', 'areas_to_analyze', 'locked_areas_to_analyze', 'successful_matches_detail', 'debug_info', 'analysis_results', 'dynamic_stopwords_used', 
-            'natuur_analysis_md', 'impact_analysis_md', 'final_report_md', 'map_image_buffer']:
-    if key not in st.session_state: st.session_state[key] = None if 'results' in key or 'buffer' in key else []
+            'natuur_analysis_md', 'impact_analysis_md', 'final_report_md', 'map_image_buffer',
+            'conclusion_topics_selected', 'conclusion_results_md']: # NIEUWE KEYS
+    if key not in st.session_state: st.session_state[key] = None if 'results' in key or 'buffer' in key or 'md' in key else []
 if 'matching_complete' not in st.session_state: st.session_state.matching_complete = False
 if 'analysis_running' not in st.session_state: st.session_state.analysis_running = False
 
 st.sidebar.header("1. Selectie Methode")
-tab1, tab2, tab3 = st.sidebar.tabs(["A. Gemeente", "B. CSV Upload", "C. Handmatig"])
+tab1, tab2 = st.sidebar.tabs(["A. Gemeente", "B. CSV Upload"])
 
 with tab1:
     st.subheader("Automatisch via Gemeente")
@@ -707,7 +764,6 @@ with tab1:
                 st.session_state.debug_info = debug
                 st.session_state.locked_areas_to_analyze = list(areas)
                 st.session_state.matching_complete = True
-                st.session_state.manual_selection = areas
                 st.rerun()
             else:
                 st.warning(message)
@@ -726,18 +782,8 @@ with tab2:
         st.session_state.debug_info = debug
         st.session_state.locked_areas_to_analyze = list(areas)
         st.session_state.matching_complete = True
-        st.session_state.manual_selection = areas
         st.success(f"CSV geladen! {len(areas)} documenten.")
         st.rerun()
-
-with tab3:
-    st.subheader("Handmatig")
-    manual_selection = st.multiselect("Selecteer gebieden:", options=all_areas, default=st.session_state.areas_to_analyze, key='manual_selection')
-    # Wis de kaart als handmatige selectie wordt aangepast
-    if set(manual_selection) != set(st.session_state.areas_to_analyze):
-        st.session_state.map_image_buffer = None
-    st.session_state.areas_to_analyze = manual_selection
-
 
 areas = st.session_state.areas_to_analyze
 matches = st.session_state.successful_matches_detail
@@ -899,7 +945,7 @@ if st.session_state.analysis_results:
                 )
                 bestandsnaam = services.get_pdf_name(omgevings_pdf)
 
-                impact_md = "\n# DEEL 2: Impact Analyse uit Omgevingsvisie\n\n"
+                impact_md = "\n# DEEL 2: Ingreep-effect relaties\n\n"
                 impact_md += f"**Geanalyseerd bestand:** {bestandsnaam}\n\n"
                 impact_md += impact_result
 
@@ -913,6 +959,66 @@ if st.session_state.analysis_results:
         with st.expander("Bekijk resultaten Stap 2", expanded=True):
             st.markdown(st.session_state.impact_analysis_md)
 
+        # --- NIEUW: STAP 3 ---
+        st.markdown("---")
+        st.header("Stap 3: Conclusies Genereren (Optioneel)")
+        st.markdown("Selecteer de onderwerpen waarover u een concluderende paragraaf wilt genereren op basis van de impactanalyse (Stap 2).")
+
+        # NIEUW: Lijst met onderwerpen voor de conclusie
+        CONCLUSION_TOPICS = [
+            "Stikstofdepositie", "Recreatiedruk en toename verstoring", "Behoud en versterken van natuur buiten Natura 2000 gebieden",
+            "Algemene Samenvatting & Aanbevelingen"
+        ]
+
+        selected_topics = st.multiselect(
+            "Kies onderwerpen voor de conclusie:",
+            options=CONCLUSION_TOPICS,
+            key='conclusion_topics_selected'
+        )
+
+        if st.button("▶️ Start Stap 3 (Genereer Conclusies)", disabled=not selected_topics):
+            if not openai_client and not dev_mode_active:
+                st.error("Kon OpenAI client niet laden. Controleer je secrets.")
+            else:
+                conclusion_results = {}
+                total_topics = len(selected_topics)
+                progress_bar = st.progress(0, text="Voorbereiden van conclusies...")
+
+                with st.spinner("Bezig met genereren van conclusies..."):
+                    for i, topic in enumerate(selected_topics):
+                        progress_bar.progress((i + 1) / total_topics, text=f"Bezig met: **{topic}** ({i+1}/{total_topics})")
+                        
+                        # In dev mode, gebruik een mock antwoord
+                        if dev_mode_active:
+                            import time
+                            time.sleep(0.5)
+                            conclusion_text = f"Dit is een mock-conclusie voor het onderwerp **{topic}**. De impactanalyse toont aan dat de geplande ontwikkelingen significante risico's met zich meebrengen."
+                        else:
+                            conclusion_text = generate_conclusion_paragraph(
+                                topic=topic,
+                                impact_analyse=st.session_state.impact_analysis_md,
+                                client=openai_client
+                            )
+                        conclusion_results[topic] = conclusion_text
+
+                progress_bar.empty()
+                
+                # Formatteer de resultaten naar Markdown
+                conclusion_md = "\n# DEEL 3: Conclusies\n\n"
+                for topic, text in conclusion_results.items():
+                    conclusion_md += f"### Conclusie: {topic}\n"
+                    conclusion_md += f"{text}\n\n"
+                
+                st.session_state.conclusion_results_md = conclusion_md
+                
+                # Werk het volledige rapport bij
+                st.session_state.final_report_md = (st.session_state.natuur_analysis_md + "\n\n---\n\n" + st.session_state.impact_analysis_md + "\n\n---\n\n" + conclusion_md)
+                st.success("Stap 3 Voltooid! Rapport bijgewerkt met conclusies.")
+                st.rerun()
+
+    if st.session_state.get('conclusion_results_md'):
+        with st.expander("Bekijk resultaten Stap 3", expanded=True):
+            st.markdown(st.session_state.conclusion_results_md)
 
 # --- DOWNLOADS & STATS ---
 
