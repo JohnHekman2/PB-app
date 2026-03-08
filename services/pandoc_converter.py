@@ -1,0 +1,143 @@
+import os
+import io
+import tempfile
+import uuid
+
+def convert_md_to_docx_pandoc(markdown_string: str, reference_docx: str = "wbtemplate.docx") -> io.BytesIO:
+    """
+    Converts markdown string to docx by:
+    1. Processing markdown to docx using pandoc and wbtemplate.docx as a reference-doc.
+    2. Opening the actual wbtemplate.docx via python-docx.
+    3. Replacing the content between the start and end markers with the pandoc elements.
+    4. Returning the merged docx as a BytesIO buffer.
+    """
+    import pypandoc
+    import docx
+    import re
+
+    # 1. Pre-process markdown: Shift Heading 3 to Heading 4
+    # This prevents the use of Heading 3 in the generated output as requested.
+    processed_md = re.sub(r'^### ', '#### ', markdown_string, flags=re.MULTILINE)
+    
+    # 1b. Fix for paragraph spacing:
+    # Pandoc typically translates \n\n to distinct paragraphs but if the Word template lacks paragraph spacing,
+    # they appear fused. We can inject a hard break <br> or a non-breaking space paragraph to force the distance 
+    # natively inside the markdown before it reaches Pandoc.
+    # To avoid breaking Markdown tables and lists, we only replace double newlines that are between regular text.
+    # A simple but robust way to force empty paragraphs in Pandoc is inserting a backslash hard break or a non-breaking space.
+    # Here we replace double newlines with double newlines containing a non-breaking space, except inside code blocks.
+    # For a general fix we can just use the HTML <br> tag which Pandoc understands and translates to a word line break.
+    processed_md = processed_md.replace('\n\n', '\n\n<br>\n\n')
+    # Clean up multiple <br>s if they pile up
+    processed_md = processed_md.replace('<br>\n\n<br>', '<br>')
+
+    # 2. Create temporary files
+    run_id = str(uuid.uuid4())
+    temp_in_md = os.path.join(tempfile.gettempdir(), f"temp_in_{run_id}.md")
+    temp_out_docx = os.path.join(tempfile.gettempdir(), f"temp_out_{run_id}.docx")
+
+    try:
+        with open(temp_in_md, "w", encoding="utf-8") as f:
+            f.write(processed_md)
+
+        # 2. Run pypandoc
+        # We use reference-doc so that Pandoc natively generates paragraphs that map to the corporation's template styles
+        extra_args = []
+        if os.path.exists(reference_docx):
+            extra_args = [f'--reference-doc={reference_docx}']
+        
+        pypandoc.convert_file(
+            temp_in_md,
+            to='docx',
+            outputfile=temp_out_docx,
+            extra_args=extra_args
+        )
+
+        # 3. Open both documents
+        if not os.path.exists(reference_docx):
+            # Fallback if the corporate template doesn't exist
+            with open(temp_out_docx, "rb") as f:
+                buffer = io.BytesIO(f.read())
+            return buffer
+
+        doc_main = docx.Document(reference_docx)
+        doc_pandoc = docx.Document(temp_out_docx)
+
+        # 4. Apply explicit formatting to Pandoc generated document before merge
+        # Provide all tables with visible borders (e.g. 'Table Grid')
+        try:
+            for tbl in doc_pandoc.tables:
+                tbl.style = 'Table Grid'
+        except Exception as e:
+            print(f"Warning: Failed to set table grid styles: {e}")
+
+        # 5. Find markers in main doc
+        start_marker_para = None
+        end_marker_table = None
+
+        for p in doc_main.paragraphs:
+            if "titel eerste hoofdstuk" in p.text.lower():
+                start_marker_para = p
+                break
+                
+        for t in doc_main.tables:
+            table_text = "".join(cell.text for row in t.rows for cell in row.cells).lower()
+            if "deze tekst laten staan" in table_text and "laatste pagina berekening" in table_text:
+                end_marker_table = t
+                break
+
+        body_main = doc_main.element.body
+        body_pandoc = doc_pandoc.element.body
+
+        # 5. Extract and inject content
+        start_idx = -1
+        end_idx = -1
+        for i, child in enumerate(body_main):
+            if start_marker_para is not None and child is start_marker_para._element:
+                start_idx = i
+            if end_marker_table is not None and child is end_marker_table._element:
+                end_idx = i
+
+        print(f"DEBUG: start_marker found: {start_idx != -1} (idx: {start_idx})")
+        print(f"DEBUG: end_marker found: {end_idx != -1} (idx: {end_idx})")
+        print(f"DEBUG: Pandoc elements count: {len(body_pandoc)}")
+
+        if start_idx != -1 and end_idx != -1:
+            tail_elements = []
+            for i in range(end_idx, len(body_main)):
+                tail_elements.append(body_main[i])
+            
+            # Remove from start_idx + 1 up to the end
+            for _ in range(len(body_main) - (start_idx + 1)):
+                body_main.remove(body_main[start_idx + 1])
+
+            import copy
+            # Insert all elements generated by pandoc, skipping the final section properties
+            for elem in body_pandoc:
+                if elem.tag.endswith('sectPr'):
+                    continue
+                body_main.append(copy.deepcopy(elem))
+
+            # Re-append the tail elements
+            for elem in tail_elements:
+                body_main.append(elem)
+        else:
+            import copy
+            # If markers aren't found, fallback to just appending
+            for elem in body_pandoc:
+                if elem.tag.endswith('sectPr'):
+                    continue
+                body_main.append(copy.deepcopy(elem))
+
+        # 6. Save merged result
+        buffer = io.BytesIO()
+        doc_main.save(buffer)
+        buffer.seek(0)
+        return buffer
+
+    finally:
+        # Cleanup temp files
+        if os.path.exists(temp_in_md):
+            os.remove(temp_in_md)
+        if os.path.exists(temp_out_docx):
+            os.remove(temp_out_docx)

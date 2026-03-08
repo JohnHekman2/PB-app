@@ -9,23 +9,13 @@ import json
 from collections import Counter
 import concurrent.futures
 import sys
+import tabulate
 
 # Third-party imports
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader 
-from langchain_text_splitters import RecursiveCharacterTextSplitter 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
-from thefuzz import process
-from thefuzz import fuzz
 from openai import OpenAI
-
-import markdown
-from htmldocx import HtmlToDocx
-from docx.shared import Inches
 
 # Utility imports
 from utils import RUIS_WOORDEN, generate_csv_from_municipality, get_geodata_for_municipality, create_map_image, PAD_GEMEENTEN
@@ -38,14 +28,19 @@ st.set_page_config(page_title="Passende beoordeling voor omgevingsvisies", layou
 VECTOR_STORE_DIRECTORY = "vector_store"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
+# Session State Initialization for AI Provider
+if "ai_provider" not in st.session_state:
+    st.session_state.ai_provider = "Interne OpenAI"
+
 try:
-    if "openai_base_url" not in st.session_state:
-        st.session_state.openai_base_url = st.secrets["BASE_URL"]
-    if "openai_api_key" not in st.session_state:
-        st.session_state.openai_api_key = st.secrets["API_KEY"]
-        
+    # Basic shared secrets (OpenAI Proxy)
     YOUR_API_BASE_URL = st.secrets["BASE_URL"]
     YOUR_API_KEY = st.secrets["API_KEY"]
+    
+    # Gemini Key (for optional use)
+    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+    GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 except KeyError:
     st.error("API keys (API_KEY or BASE_URL) not found in `.streamlit/secrets.toml`.")
     st.stop()
@@ -173,39 +168,67 @@ Geef daarin in een paar zinnen de algemene conclusie (overzicht van verslechteri
 
 @st.cache_resource
 def get_embedding_model():
+    from langchain_huggingface import HuggingFaceEmbeddings
     print("Loading embedding model...")
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={'device': 'cpu'})
 
 @st.cache_resource
 def get_vector_store():
+    from langchain_chroma import Chroma
     print("Loading vector store...")
     return Chroma(persist_directory=VECTOR_STORE_DIRECTORY, embedding_function=get_embedding_model())
 
 @st.cache_resource
-def get_custom_llm():
+def get_custom_llm(provider):
+    from langchain_openai import ChatOpenAI
     """LangChain wrapper voor RAG taken"""
-    print("Initializing custom LLM connection...")
-    return ChatOpenAI(
-        model="gpt-5-mini",
-        api_key=YOUR_API_KEY,
-        base_url=YOUR_API_BASE_URL,
-        temperature=1
-    )
+    print(f"Initializing custom LLM connection for {provider}...")
+    
+    if provider == "Mijn Gemini":
+        if not GEMINI_API_KEY:
+            st.error("GEMINI_API_KEY niet gevonden in secrets.toml.")
+            st.stop()
+        return ChatOpenAI(
+            model="gemini-2.5-flash",
+            api_key=GEMINI_API_KEY,
+            base_url=GEMINI_BASE_URL,
+            temperature=1
+        )
+    else:
+        # Default: Interne OpenAI
+        return ChatOpenAI(
+            model="gpt-5-mini",
+            api_key=YOUR_API_KEY,
+            base_url=YOUR_API_BASE_URL,
+            temperature=1
+        )
 
 @st.cache_resource
-def get_openai_client():
-    api_key = st.session_state.get('openai_api_key')
-    base_url = st.session_state.get('openai_base_url')
-    
-    if base_url and not base_url.endswith("/v1"):
-        base_url = base_url.rstrip('/') + '/v1' 
-        
-    if api_key and base_url:
-        return OpenAI(api_key=api_key, base_url=base_url)
-    return None
+def get_openai_client(provider):
+    if provider == "Mijn Gemini":
+        if not GEMINI_API_KEY:
+            return None
+        return OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+    else:
+        # Default: Interne OpenAI
+        base_url = YOUR_API_BASE_URL
+        if base_url and not base_url.endswith("/v1"):
+            base_url = base_url.rstrip('/') + '/v1' 
+        return OpenAI(api_key=YOUR_API_KEY, base_url=base_url)
 
 @st.cache_data
 def get_all_area_names():
+    # NIEUW: Probeer eerst de JSON cache te laden
+    area_names_path = os.path.join(VECTOR_STORE_DIRECTORY, "area_names.json")
+    if os.path.exists(area_names_path):
+        try:
+            with open(area_names_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading area_names.json: {e}")
+
+    # Fallback: Ouderwetse methode (traag)
+    print("Fallback: Loading unique area names from vector store...")
     vector_store = get_vector_store()
     documents = vector_store.get(include=['metadatas'])
     unique_area_names = set()
@@ -284,7 +307,7 @@ def load_introduction_from_docx(file_path):
         full_text = []
         for para in doc.paragraphs:
             if para.text.strip():
-                full_text.append(para.text)
+                full_text.append(para.text.strip())
         return "\n\n".join(full_text)
     except Exception as e:
         return f"*(Fout bij laden inleiding uit {file_path}: {e})*"
@@ -387,6 +410,9 @@ def flatten_results_to_df(results_dict):
 def convert_markdown_to_docx_bytes(markdown_string: str, map_image_buffer: io.BytesIO = None) -> io.BytesIO:
     """Converteert Markdown string naar een Word document op basis van wbtemplate.docx."""
     import docx
+    from htmldocx import HtmlToDocx
+    from docx.shared import Inches
+    import markdown
     
     template_path = "wbtemplate.docx"
     if not os.path.exists(template_path):
@@ -501,6 +527,7 @@ def convert_markdown_to_docx_bytes(markdown_string: str, map_image_buffer: io.By
     return buffer
 
 def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: str = 'naam_n2k', threshold: int = 60):
+    from thefuzz import process, fuzz
     dynamic_stopwords = calculate_dynamic_stopwords(all_available_areas, frequency_threshold=0.05)
     st.session_state.dynamic_stopwords_used = sorted(list(dynamic_stopwords))
 
@@ -556,6 +583,7 @@ def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: 
 
 
 def analyze_local_pdf(uploaded_file, client):
+    from langchain_community.document_loaders import PyPDFLoader
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
         tmp_path = tmp_file.name
@@ -567,8 +595,11 @@ def analyze_local_pdf(uploaded_file, client):
         
         prompt_content = IMPACT_PROMPT_FULL.format(context=full_text)
         
+        # Bepaal het model op basis van de provider
+        model_name = "gemini-2.5-flash" if st.session_state.ai_provider == "Mijn Gemini" else "gpt-5-mini"
+
         response = client.chat.completions.create(
-            model="gpt-5-mini", 
+            model=model_name, 
             messages=[
                 {"role": "system", "content": "Je bent een expert in ruimtelijke ordening en ecologie."},
                 {"role": "user", "content": prompt_content}
@@ -596,8 +627,11 @@ def generate_conclusion_paragraph(topic: str, impact_analyse: str, client) -> st
     )
     
     try:
+        # Bepaal het model op basis van de provider
+        model_name = "gemini-2.5-flash" if st.session_state.ai_provider == "Mijn Gemini" else "gpt-5-mini"
+
         response = client.chat.completions.create(
-            model="gpt-5-mini",
+            model=model_name,
             messages=[
                 {"role": "system", "content": "Je bent een expert in ecologie en ruimtelijke ordening."},
                 {"role": "user", "content": prompt_content}
@@ -711,10 +745,16 @@ st.title("🌱 Passende Beoordeling voor Omgevingsvisies en programma's")
 st.markdown("Stap 1: Analyseer Natura 2000 doelen. Stap 2: Analyseer impact vanuit Omgevingsvisie.")
 
 try:
-    vector_store = get_vector_store()
-    llm = get_custom_llm()
-    openai_client = get_openai_client()
-    all_areas = get_all_area_names()
+    # Provider selectie (hier gezet zodat het voor de initialisatie van LLM komt)
+    st.sidebar.subheader("🤖 AI Instellingen")
+    ai_provider = st.sidebar.radio(
+        "Kies AI Provider:",
+        options=["Interne OpenAI", "Mijn Gemini"],
+        index=0 if st.session_state.ai_provider == "Interne OpenAI" else 1,
+        key="ai_provider_radio"
+    )
+    st.session_state.ai_provider = ai_provider
+
 except Exception as e:
     st.error(f"Fout bij initialisatie: {e}")
     st.stop()
@@ -758,6 +798,7 @@ with tab1:
                 st.session_state.csv_file_buffer = csv_buffer
                 
                 # 3. Match gebieden
+                all_areas = get_all_area_names()
                 matches, areas, debug = match_areas_from_csv(io.BytesIO(csv_buffer.getvalue()), all_areas)
                 st.session_state.successful_matches_detail = matches
                 st.session_state.areas_to_analyze = areas
@@ -776,6 +817,7 @@ with tab2:
     if uploaded_file:
         # Wis de kaart als er een nieuwe upload is
         st.session_state.map_image_buffer = None
+        all_areas = get_all_area_names()
         matches, areas, debug = match_areas_from_csv(uploaded_file, all_areas)
         st.session_state.successful_matches_detail = matches
         st.session_state.areas_to_analyze = areas
@@ -881,8 +923,11 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
     else:
         st.session_state.analysis_running = True
         try:
+            # Lazy initialize heavy objects just before use
+            vector_store = get_vector_store()
+            llm = get_custom_llm(st.session_state.ai_provider)
+            
             # De code hoeft niet meer te weten of het in dev-modus is.
-            # Het roept simpelweg de geïnjecteerde service aan.
             results = services.run_batch_analysis(
                 vector_store=vector_store, 
                 llm=llm, 
@@ -934,6 +979,9 @@ if st.session_state.analysis_results:
     can_run_step_2 = (omgevings_pdf is not None) or dev_mode_active
 
     if can_run_step_2 and st.button("▶️ Start Stap 2 (Impact Analyse)"):
+        # Lazy initialize openai client
+        openai_client = get_openai_client(st.session_state.ai_provider)
+
         if not openai_client and not dev_mode_active:
             st.error("Kon OpenAI client niet laden. Controleer je secrets.")
         else:
@@ -977,6 +1025,9 @@ if st.session_state.analysis_results:
         )
 
         if st.button("▶️ Start Stap 3 (Genereer Conclusies)", disabled=not selected_topics):
+            # Lazy initialize openai client
+            openai_client = get_openai_client(st.session_state.ai_provider)
+
             if not openai_client and not dev_mode_active:
                 st.error("Kon OpenAI client niet laden. Controleer je secrets.")
             else:
@@ -1027,11 +1078,20 @@ if st.session_state.final_report_md:
     st.header("📥 Download Eindrapport")
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.download_button("⬇️ Download Volledig Rapport (.md)", st.session_state.final_report_md, f"rapport_compleet_{timestamp}.md")
     
     docx_data = convert_markdown_to_docx_bytes(st.session_state.final_report_md, st.session_state.get('map_image_buffer'))
     c2.download_button("⬇️ Download Volledig Rapport (.docx)", docx_data, f"rapport_compleet_{timestamp}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    with c3:
+        if st.button("Genereer Pandoc Document (Beta)"):
+            with st.spinner("Document genereren met Pandoc..."):
+                from services.pandoc_converter import convert_md_to_docx_pandoc
+                st.session_state.pandoc_docx_data = convert_md_to_docx_pandoc(st.session_state.final_report_md)
+        
+        if st.session_state.get('pandoc_docx_data'):
+            st.download_button("⬇️ Download Pandoc (.docx)", st.session_state.pandoc_docx_data, f"rapport_pandoc_{timestamp}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="pandoc_dl")
 
 if st.session_state.analysis_results:
     df_stats = flatten_results_to_df(st.session_state.analysis_results)

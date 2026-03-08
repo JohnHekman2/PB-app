@@ -1,11 +1,9 @@
+from __future__ import annotations
 import os
 import re
 import io
 import pandas as pd
-import geopandas as gpd
 import warnings
-import matplotlib.pyplot as plt # type: ignore
-import contextily as cx # pyright: ignore[reportMissingImports]
 
 # --- Configuratie (Paden naar Geo-bestanden) ---
 PAD_GEMEENTEN = "supportdata/Gemeentegrenzen.gml" 
@@ -37,6 +35,8 @@ def create_map_image(municipality_gdf: gpd.GeoDataFrame, areas_gdf: gpd.GeoDataF
         Een io.BytesIO object met de PNG-afbeelding van de kaart, of None bij een fout.
     """
     try:
+        import matplotlib.pyplot as plt
+        import contextily as cx
         fig, ax = plt.subplots(figsize=(10, 10))
 
         # Plot de natuurgebieden
@@ -105,6 +105,7 @@ def get_geodata_for_municipality(municipality: str) -> tuple[str, gpd.GeoDataFra
         return "Voer alstublieft een geldige gemeentenaam in.", None, None
 
     try:
+        import geopandas as gpd
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             
