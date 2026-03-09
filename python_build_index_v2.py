@@ -68,6 +68,12 @@ def main(rebuild=False):
             import shutil
             shutil.rmtree(VECTOR_STORE_DIRECTORY)
             print(f"  ✓ Deleted {VECTOR_STORE_DIRECTORY}/")
+        
+        # Also delete area_names.json if rebuilding
+        area_names_path = os.path.join(VECTOR_STORE_DIRECTORY, "area_names.json")
+        if os.path.exists(area_names_path):
+            os.remove(area_names_path)
+
         if os.path.exists(PROCESSED_FILES_LOG):
             os.remove(PROCESSED_FILES_LOG)
             print(f"  ✓ Deleted {PROCESSED_FILES_LOG}")
@@ -179,6 +185,26 @@ def main(rebuild=False):
 
     processed_files.update(new_pdfs)
     save_processed_files(processed_files)
+
+    # NIEUW: Genereer area_names.json cache voor de frontend
+    print("\nGenerating area names cache...")
+    try:
+        all_unique_areas = set()
+        # Haal alle area_names op uit de vector store (ook de bestaande)
+        results = vector_store.get(include=['metadatas'])
+        for meta in results['metadatas']:
+            if 'area_name' in meta:
+                all_unique_areas.add(meta['area_name'])
+        
+        area_names_path = os.path.join(VECTOR_STORE_DIRECTORY, "area_names.json")
+        if not os.path.exists(VECTOR_STORE_DIRECTORY):
+            os.makedirs(VECTOR_STORE_DIRECTORY)
+            
+        with open(area_names_path, 'w', encoding='utf-8') as f:
+            json.dump(sorted(list(all_unique_areas)), f, ensure_ascii=False, indent=2)
+        print(f"  ✓ Saved {len(all_unique_areas)} unique area names to {area_names_path}")
+    except Exception as e:
+        print(f"  ✗ Error generating area names cache: {e}")
 
     print("\n--- SUCCESS! ---")
     print(f"Vector store updated. Total files processed: {len(processed_files)}")
