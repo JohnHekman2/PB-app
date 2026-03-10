@@ -9,7 +9,6 @@ import json
 from collections import Counter
 import concurrent.futures
 import sys
-import tabulate
 
 # Third-party imports
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
@@ -18,9 +17,13 @@ from langchain_core.output_parsers import StrOutputParser
 from openai import OpenAI
 
 # Utility & Service imports
+from services.config import AppConfig
+from services.logging_config import get_logger, get_token_logger
+from services.token_tracker import TokenUsageTracker
 from services.geodata_service import RUIS_WOORDEN, generate_csv_from_municipality, get_geodata_for_municipality, create_map_image, PAD_GEMEENTEN
-from services.llm_service import get_embedding_model, get_vector_store, get_custom_llm, get_openai_client
-from services.data_processing import get_all_area_names, load_gemeenten, match_areas_from_csv, parse_json_response, format_json_to_markdown, flatten_results_to_df
+from services.cache_manager import get_vector_store, get_custom_llm, get_openai_client
+from services.cache_manager import get_all_area_names, load_gemeenten
+from services.data_processing import match_areas_from_csv, parse_json_response, format_json_to_markdown, flatten_results_to_df, CSVProcessingError
 from services.document_service import load_introduction_from_docx, convert_markdown_to_docx_bytes
 from services.llm_analysis_service import analyze_local_pdf, generate_conclusion_paragraph
 from services.rag_service import run_batch_analysis
@@ -37,18 +40,29 @@ EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 if "ai_provider" not in st.session_state:
     st.session_state.ai_provider = "Interne OpenAI"
 
+# Initialize AppConfig from Streamlit secrets (once at startup)
+app_config = None
 try:
-    # Basic shared secrets (OpenAI Proxy)
-    YOUR_API_BASE_URL = st.secrets["BASE_URL"]
-    YOUR_API_KEY = st.secrets["API_KEY"]
-    
-    # Gemini Key (for optional use)
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
-    GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-
-except KeyError:
-    st.error("API keys (API_KEY or BASE_URL) not found in `.streamlit/secrets.toml`.")
+    # Create AppConfig from secrets, passing current ai_provider
+    app_config = AppConfig.from_streamlit_secrets(st.secrets, ai_provider=st.session_state.ai_provider)
+    app_config.validate()
+except KeyError as e:
+    st.error(f"API keys (API_KEY or BASE_URL) not found in `.streamlit/secrets.toml`. Missing: {str(e)}")
     st.stop()
+except ValueError as e:
+    st.error(f"Configuration error: {str(e)}")
+    st.stop()
+
+# Initialize logging and token tracking
+logger = get_logger()
+log_entry_point = logger if not hasattr(st, '_is_running_with_streamlit') else None
+
+# Initialize token tracker for this session (use session hash as session ID)
+import hashlib
+session_hash = hashlib.md5(str(st.session_state).encode()).hexdigest()[:8]
+if "token_tracker" not in st.session_state:
+    st.session_state.token_tracker = TokenUsageTracker(session_id=session_hash)
+token_tracker = st.session_state.token_tracker
 
 # --- 3. PROMPT TEMPLATES ---
 SYSTEM_TEMPLATE = """
@@ -247,6 +261,9 @@ try:
         key="ai_provider_radio"
     )
     st.session_state.ai_provider = ai_provider
+    # Update app_config with new ai_provider
+    if app_config:
+        app_config.ai_provider = ai_provider
 
 except Exception as e:
     st.error(f"Fout bij initialisatie: {e}")
@@ -292,13 +309,19 @@ with tab1:
                 
                 # 3. Match gebieden
                 all_areas = get_all_area_names()
-                matches, areas, debug = match_areas_from_csv(io.BytesIO(csv_buffer.getvalue()), all_areas)
-                st.session_state.successful_matches_detail = matches
-                st.session_state.areas_to_analyze = areas
-                st.session_state.debug_info = debug
-                st.session_state.locked_areas_to_analyze = list(areas)
-                st.session_state.matching_complete = True
-                st.rerun()
+                try:
+                    matches, areas, debug, stopwords = match_areas_from_csv(io.BytesIO(csv_buffer.getvalue()), all_areas)
+                    st.session_state.successful_matches_detail = matches
+                    st.session_state.areas_to_analyze = areas
+                    st.session_state.debug_info = debug
+                    st.session_state.dynamic_stopwords_used = stopwords
+                    st.session_state.locked_areas_to_analyze = list(areas)
+                    st.session_state.matching_complete = True
+                    st.rerun()
+                except CSVProcessingError as e:
+                    st.error(f"CSV-verwerkingsfout: {str(e)}")
+                    st.session_state.matching_complete = False
+                    st.stop()
             else:
                 st.warning(message)
         else:
@@ -311,14 +334,19 @@ with tab2:
         # Wis de kaart als er een nieuwe upload is
         st.session_state.map_image_buffer = None
         all_areas = get_all_area_names()
-        matches, areas, debug = match_areas_from_csv(uploaded_file, all_areas)
-        st.session_state.successful_matches_detail = matches
-        st.session_state.areas_to_analyze = areas
-        st.session_state.debug_info = debug
-        st.session_state.locked_areas_to_analyze = list(areas)
-        st.session_state.matching_complete = True
-        st.success(f"CSV geladen! {len(areas)} documenten.")
-        st.rerun()
+        try:
+            matches, areas, debug, stopwords = match_areas_from_csv(uploaded_file, all_areas)
+            st.session_state.successful_matches_detail = matches
+            st.session_state.areas_to_analyze = areas
+            st.session_state.debug_info = debug
+            st.session_state.dynamic_stopwords_used = stopwords
+            st.session_state.locked_areas_to_analyze = list(areas)
+            st.session_state.matching_complete = True
+            st.success(f"CSV geladen! {len(areas)} documenten.")
+            st.rerun()
+        except CSVProcessingError as e:
+            st.error(f"CSV-verwerkingsfout: {str(e)}")
+            st.session_state.matching_complete = False
 
 areas = st.session_state.areas_to_analyze
 matches = st.session_state.successful_matches_detail
@@ -418,7 +446,14 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
         try:
             # Lazy initialize heavy objects just before use
             vector_store = get_vector_store()
-            llm = get_custom_llm(st.session_state.ai_provider)
+            llm = get_custom_llm(app_config)
+            
+            # Define progress callback for batch analysis
+            progress_bar = st.progress(0, text="Analyse wordt voorbereid...")
+            total_areas = len(target_areas)
+            
+            def update_progress(fraction: float, message: str):
+                progress_bar.progress(fraction, text=message)
             
             # De code hoeft niet meer te weten of het in dev-modus is.
             results = services.run_batch_analysis(
@@ -427,9 +462,13 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
                 selected_areas=target_areas, 
                 concept_check_prompt=CONCEPT_CHECK_PROMPT, 
                 table_generation_prompt=TABLE_GENERATION_PROMPT, 
-                system_template=SYSTEM_TEMPLATE
+                system_template=SYSTEM_TEMPLATE,
+                progress_callback=update_progress,
+                token_tracker=token_tracker,
+                ai_provider=st.session_state.ai_provider
             )
-
+            
+            progress_bar.empty()
             st.session_state.analysis_results = results
             
             if results:
@@ -454,7 +493,7 @@ if st.button("▶️ Start Stap 1 (Natuurdoelen)", disabled=not areas):
                 st.success("Stap 1 Voltooid!")
                 st.rerun()
         except Exception as e:
-            st.error(f"Fout: {e}")
+            st.error(f"Fout in Stap 1: {str(e)}")
         finally:
             st.session_state.analysis_running = False
 
@@ -473,30 +512,35 @@ if st.session_state.analysis_results:
 
     if can_run_step_2 and st.button("▶️ Start Stap 2 (Impact Analyse)"):
         # Lazy initialize openai client
-        openai_client = get_openai_client(st.session_state.ai_provider)
+        try:
+            openai_client = get_openai_client(app_config)
 
-        if not openai_client and not dev_mode_active:
-            st.error("Kon OpenAI client niet laden. Controleer je secrets.")
-        else:
-            with st.spinner("Bezig met analyseren van volledige Omgevingsvisie..."):
-                # Roep de juiste service aan (echt of mock)
-                impact_result = services.analyze_local_pdf(
-                    uploaded_file=omgevings_pdf, 
-                    client=openai_client,
-                    system_prompt="Je bent een expert in ruimtelijke ordening en ecologie.",
-                    impact_prompt=IMPACT_PROMPT_FULL
-                )
-                bestandsnaam = services.get_pdf_name(omgevings_pdf)
+            if not openai_client and not dev_mode_active:
+                st.error("Kon OpenAI client niet laden. Controleer je secrets.")
+            else:
+                with st.spinner("Bezig met analyseren van volledige Omgevingsvisie..."):
+                    # Roep de juiste service aan (echt of mock)
+                    impact_result = services.analyze_local_pdf(
+                        uploaded_file=omgevings_pdf, 
+                        client=openai_client,
+                        system_prompt="Je bent een expert in ruimtelijke ordening en ecologie.",
+                        impact_prompt=IMPACT_PROMPT_FULL,
+                        ai_provider=st.session_state.ai_provider,
+                        token_tracker=token_tracker
+                    )
+                    bestandsnaam = services.get_pdf_name(omgevings_pdf)
 
-                impact_md = "\n# DEEL 2: Ingreep-effect relaties\n\n"
-                impact_md += f"**Geanalyseerd bestand:** {bestandsnaam}\n\n"
-                impact_md += impact_result
+                    impact_md = "\n# DEEL 2: Ingreep-effect relaties\n\n"
+                    impact_md += f"**Geanalyseerd bestand:** {bestandsnaam}\n\n"
+                    impact_md += impact_result
 
-                st.session_state.impact_analysis_md = impact_md
-                
-                st.session_state.final_report_md = st.session_state.natuur_analysis_md + "\n\n---\n\n" + impact_md
-                st.success("Stap 2 Voltooid! Rapport bijgewerkt.")
-                st.rerun()
+                    st.session_state.impact_analysis_md = impact_md
+                    
+                    st.session_state.final_report_md = st.session_state.natuur_analysis_md + "\n\n---\n\n" + impact_md
+                    st.success("Stap 2 Voltooid! Rapport bijgewerkt.")
+                    st.rerun()
+        except Exception as e:
+            st.error(f"Fout in Stap 2: {str(e)}")
 
     if st.session_state.impact_analysis_md:
         with st.expander("Bekijk resultaten Stap 2", expanded=True):
@@ -521,47 +565,55 @@ if st.session_state.analysis_results:
 
         if st.button("▶️ Start Stap 3 (Genereer Conclusies)", disabled=not selected_topics):
             # Lazy initialize openai client
-            openai_client = get_openai_client(st.session_state.ai_provider)
+            try:
+                openai_client = get_openai_client(app_config)
 
-            if not openai_client and not dev_mode_active:
-                st.error("Kon OpenAI client niet laden. Controleer je secrets.")
-            else:
-                conclusion_results = {}
-                total_topics = len(selected_topics)
-                progress_bar = st.progress(0, text="Voorbereiden van conclusies...")
+                if not openai_client and not dev_mode_active:
+                    st.error("Kon OpenAI client niet laden. Controleer je secrets.")
+                else:
+                    conclusion_results = {}
+                    total_topics = len(selected_topics)
+                    progress_bar = st.progress(0, text="Voorbereiden van conclusies...")
 
-                with st.spinner("Bezig met genereren van conclusies..."):
-                    for i, topic in enumerate(selected_topics):
-                        progress_bar.progress((i + 1) / total_topics, text=f"Bezig met: **{topic}** ({i+1}/{total_topics})")
-                        
-                        # In dev mode, gebruik een mock antwoord
-                        if dev_mode_active:
-                            import time
-                            time.sleep(0.5)
-                            conclusion_text = f"Dit is een mock-conclusie voor het onderwerp **{topic}**. De impactanalyse toont aan dat de geplande ontwikkelingen significante risico's met zich meebrengen."
-                        else:
-                            conclusion_text = generate_conclusion_paragraph(
-                                topic=topic,
-                                impact_analyse=st.session_state.impact_analysis_md,
-                                client=openai_client,
-                                conclusion_prompt_template=CONCLUSION_PROMPT_TEMPLATE
-                            )
-                        conclusion_results[topic] = conclusion_text
+                    with st.spinner("Bezig met genereren van conclusies..."):
+                        for i, topic in enumerate(selected_topics):
+                            progress_bar.progress((i + 1) / total_topics, text=f"Bezig met: **{topic}** ({i+1}/{total_topics})")
+                            
+                            # In dev mode, gebruik een mock antwoord
+                            if dev_mode_active:
+                                import time
+                                time.sleep(0.5)
+                                conclusion_text = f"Dit is een mock-conclusie voor het onderwerp **{topic}**. De impactanalyse toont aan dat de geplande ontwikkelingen significante risico's met zich meebrengen."
+                            else:
+                                try:
+                                    conclusion_text = generate_conclusion_paragraph(
+                                        topic=topic,
+                                        impact_analyse=st.session_state.impact_analysis_md,
+                                        client=openai_client,
+                                        conclusion_prompt_template=CONCLUSION_PROMPT_TEMPLATE,
+                                        ai_provider=st.session_state.ai_provider,
+                                        token_tracker=token_tracker
+                                    )
+                                except Exception as e:
+                                    conclusion_text = f"*(Fout bij het genereren van conclusie voor '{topic}': {str(e)})*"
+                            conclusion_results[topic] = conclusion_text
 
-                progress_bar.empty()
-                
-                # Formatteer de resultaten naar Markdown
-                conclusion_md = "\n# DEEL 3: Conclusies\n\n"
-                for topic, text in conclusion_results.items():
-                    conclusion_md += f"### Conclusie: {topic}\n"
-                    conclusion_md += f"{text}\n\n"
-                
-                st.session_state.conclusion_results_md = conclusion_md
-                
-                # Werk het volledige rapport bij
-                st.session_state.final_report_md = (st.session_state.natuur_analysis_md + "\n\n---\n\n" + st.session_state.impact_analysis_md + "\n\n---\n\n" + conclusion_md)
-                st.success("Stap 3 Voltooid! Rapport bijgewerkt met conclusies.")
-                st.rerun()
+                    progress_bar.empty()
+                    
+                    # Formatteer de resultaten naar Markdown
+                    conclusion_md = "\n# DEEL 3: Conclusies\n\n"
+                    for topic, text in conclusion_results.items():
+                        conclusion_md += f"### Conclusie: {topic}\n"
+                        conclusion_md += f"{text}\n\n"
+                    
+                    st.session_state.conclusion_results_md = conclusion_md
+                    
+                    # Werk het volledige rapport bij
+                    st.session_state.final_report_md = (st.session_state.natuur_analysis_md + "\n\n---\n\n" + st.session_state.impact_analysis_md + "\n\n---\n\n" + conclusion_md)
+                    st.success("Stap 3 Voltooid! Rapport bijgewerkt met conclusies.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Fout in Stap 3: {str(e)}")
 
     if st.session_state.get('conclusion_results_md'):
         with st.expander("Bekijk resultaten Stap 3", expanded=True):
@@ -601,3 +653,43 @@ if st.session_state.analysis_results:
         with col2:
             st.subheader("Verdeling van Oordelen")
             st.bar_chart(pd.crosstab(df_stats['Categorie'], df_stats['Oordeel']))
+
+# --- TOKEN USAGE STATS ---
+if token_tracker and token_tracker.stats.operations_count > 0:
+    st.markdown("---")
+    st.header("🔌 API Token Usage")
+    with st.expander("Token Verbruik Details", expanded=False):
+        token_stats = token_tracker.get_stats()
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("📤 Input Tokens", f"{token_stats.total_input_tokens:,}")
+        col2.metric("📥 Output Tokens", f"{token_stats.total_output_tokens:,}")
+        col3.metric("🔋 Total Tokens", f"{token_stats.total_tokens:,}")
+        col4.metric("⚡ Operations", token_stats.operations_count)
+        
+        # Show breakdown by operation type
+        if token_stats.operations_by_type:
+            st.subheader("Token Usage by Operation")
+            op_data = pd.DataFrame({
+                "Operation": list(token_stats.operations_by_type.keys()),
+                "Count": list(token_stats.operations_by_type.values())
+            })
+            st.bar_chart(op_data.set_index("Operation"))
+        
+        # Show breakdown by provider
+        if token_stats.operations_by_provider:
+            st.subheader("Operations by Provider")
+            provider_data = pd.DataFrame({
+                "Provider": list(token_stats.operations_by_provider.keys()),
+                "Count": list(token_stats.operations_by_provider.values())
+            })
+            st.bar_chart(provider_data.set_index("Provider"))
+        
+        # Show summary
+        st.subheader("Summary")
+        st.write(f"**Session Duration:** {token_stats.elapsed_seconds:.1f} seconds")
+        st.write(f"**Average Token Rate:** {token_stats.tokens_per_second:.1f} tokens/second")
+        
+        # Show full stats as JSON for programmatic use
+        with st.expander("Raw Data (JSON)"):
+            st.json(token_stats.to_dict())

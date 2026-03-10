@@ -1,51 +1,72 @@
+"""
+Data processing service for area matching and CSV handling.
+No Streamlit dependencies.
+
+All data is returned from functions; callers are responsible for storing in session state
+or other persistence layers.
+"""
+
 import os
 import json
 import re
 from collections import Counter
 import pandas as pd
-import streamlit as st
 
 # Local imports
-from services.llm_service import get_vector_store, VECTOR_STORE_DIRECTORY
-from services.geodata_service import PAD_GEMEENTEN, RUIS_WOORDEN
+from services.cache_manager import get_vector_store, get_all_area_names, load_gemeenten
+from services.geodata_service import RUIS_WOORDEN
 
-@st.cache_data
-def get_all_area_names():
-    # Probeer eerst de JSON cache te laden
-    area_names_path = os.path.join(VECTOR_STORE_DIRECTORY, "area_names.json")
-    if os.path.exists(area_names_path):
-        try:
-            with open(area_names_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error loading area_names.json: {e}")
+# Configuration constants
+VECTOR_STORE_DIRECTORY = "vector_store"
 
-    # Fallback: Ouderwetse methode (traag)
-    print("Fallback: Loading unique area names from vector store...")
-    vector_store = get_vector_store()
-    documents = vector_store.get(include=['metadatas'])
-    unique_area_names = set()
-    for metadata in documents['metadatas']:
-        if 'area_name' in metadata:
-            unique_area_names.add(metadata['area_name'])
-    return sorted(list(unique_area_names))
 
-@st.cache_data
-def load_gemeenten():
-    try:
-        import geopandas as gpd
-        if not os.path.exists(PAD_GEMEENTEN):
-            return []
-        gemeenten_gdf = gpd.read_file(PAD_GEMEENTEN)
-        return sorted(gemeenten_gdf['Gemeentenaam'].unique().tolist())
-    except Exception as e:
-        print(f"Error loading gemeenten: {e}")
-        return []
+class CSVProcessingError(Exception):
+    """Raised when CSV processing fails."""
+    pass
+
+
+class AreaMatchingError(Exception):
+    """Raised when area matching fails."""
+    pass
+
+
+def get_all_area_names_data():
+    """
+    Wrapper around cache_manager for backwards compatibility.
+    Returns all unique area names from vector store.
+    
+    Returns:
+        Sorted list of area names
+    """
+    return get_all_area_names(VECTOR_STORE_DIRECTORY)
+
+
+def load_gemeenten_data():
+    """
+    Wrapper around cache_manager for backwards compatibility.
+    Returns all unique municipality names.
+    
+    Returns:
+        Sorted list of municipality names
+    """
+    return load_gemeenten()
+
 
 def calculate_dynamic_stopwords(all_names: list, frequency_threshold: float = 0.05):
+    """
+    Calculate dynamic stopwords based on frequency of words in area names.
+    
+    Args:
+        all_names: List of area names to analyze
+        frequency_threshold: Minimum frequency (0-1) for a word to be considered noise
+        
+    Returns:
+        Set of stopwords to filter
+    """
     word_counter = Counter()
     total_docs = len(all_names)
-    if total_docs == 0: return set()
+    if total_docs == 0:
+        return set()
 
     for name in all_names:
         clean = re.sub(r'[^a-z0-9\s]+', ' ', name.lower())
@@ -59,7 +80,18 @@ def calculate_dynamic_stopwords(all_names: list, frequency_threshold: float = 0.
             dynamic_noise.add(word)
     return dynamic_noise
 
+
 def clean_area_name_for_matching(name: str, dynamic_stopwords: set = None) -> str:
+    """
+    Clean area name for matching by removing punctuation, lowercasing, and filtering stopwords.
+    
+    Args:
+        name: Area name to clean
+        dynamic_stopwords: Optional set of dynamic stopwords to filter
+        
+    Returns:
+        Cleaned area name
+    """
     clean_name = name.lower()
     clean_name = re.sub(r'[^a-z0-9\s]+', ' ', clean_name)
     words = clean_name.split()
@@ -70,28 +102,51 @@ def clean_area_name_for_matching(name: str, dynamic_stopwords: set = None) -> st
     clean_name = ' '.join(filtered_words)
     return re.sub(r'\s+', ' ', clean_name).strip()
 
+
 def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: str = 'naam_n2k', threshold: int = 60):
+    """
+    Match areas from a CSV file to available areas in the system.
+    
+    Args:
+        uploaded_file: Uploaded CSV file (file-like object)
+        all_available_areas: List of available area names to match against
+        column_name: Name of CSV column containing area names (default: 'naam_n2k')
+        threshold: Minimum match score (0-100) to consider a match successful
+        
+    Returns:
+        Tuple of (successful_matches, analyzed_areas, debug_info, dynamic_stopwords)
+        Where:
+        - successful_matches: List of dicts with matched area details
+        - analyzed_areas: Sorted list of matched area names
+        - debug_info: List of dicts with unmatched areas
+        - dynamic_stopwords: Sorted list of calculated stopwords
+        
+    Raises:
+        CSVProcessingError: If CSV processing fails
+    """
     from thefuzz import process, fuzz
+    
     dynamic_stopwords = calculate_dynamic_stopwords(all_available_areas, frequency_threshold=0.05)
-    st.session_state.dynamic_stopwords_used = sorted(list(dynamic_stopwords))
 
     try:
         df = pd.read_csv(uploaded_file) 
         if column_name not in df.columns:
-            st.error(f"Kolom '{column_name}' niet gevonden in CSV.")
-            return [], [], [] 
+            raise CSVProcessingError(f"Kolom '{column_name}' niet gevonden in CSV. Beschikbare kolommen: {', '.join(df.columns)}")
         
         distance_map = {}
         if 'afstand_km' in df.columns:
             for _, row in df.iterrows():
                 name_key = str(row[column_name]).strip()
-                try: distance_map[name_key] = float(row['afstand_km'])
-                except: distance_map[name_key] = None
+                try: 
+                    distance_map[name_key] = float(row['afstand_km'])
+                except ValueError: 
+                    distance_map[name_key] = None
 
         csv_names = df[column_name].astype(str).str.strip().unique().tolist()
+    except CSVProcessingError:
+        raise
     except Exception as e:
-        st.error(f"Fout bij lezen CSV: {e}")
-        return [], [], []
+        raise CSVProcessingError(f"Fout bij lezen CSV: {str(e)}")
 
     areas_to_analyze_indexed = set()
     successful_matches_detail = []
@@ -100,7 +155,8 @@ def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: 
     indexed_map = {}
     for full_name in all_available_areas:
         clean_key = clean_area_name_for_matching(full_name, dynamic_stopwords)
-        if clean_key: indexed_map[clean_key] = full_name
+        if clean_key: 
+            indexed_map[clean_key] = full_name
     unique_indexed_signatures = list(indexed_map.keys())
 
     for csv_name in csv_names:
@@ -119,11 +175,24 @@ def match_areas_from_csv(uploaded_file, all_available_areas: list, column_name: 
 
         if score >= threshold and original_indexed_name:
             areas_to_analyze_indexed.add(original_indexed_name)
-            successful_matches_detail.append({'csv_name': csv_name, 'indexed_name': original_indexed_name, 'cleaned_match': f"'{cleaned_csv_signature}' == '{best_match_signature}'", 'score': score, 'distance': dist})
+            successful_matches_detail.append({
+                'csv_name': csv_name, 
+                'indexed_name': original_indexed_name, 
+                'cleaned_match': f"'{cleaned_csv_signature}' == '{best_match_signature}'", 
+                'score': score, 
+                'distance': dist
+            })
         else:
-            debug_info.append({'csv_name': csv_name, 'best_candidate': original_indexed_name, 'cleaned_match': f"'{cleaned_csv_signature}' vs '{best_match_signature}'", 'score': score, 'distance': dist})
+            debug_info.append({
+                'csv_name': csv_name, 
+                'best_candidate': original_indexed_name, 
+                'cleaned_match': f"'{cleaned_csv_signature}' vs '{best_match_signature}'", 
+                'score': score, 
+                'distance': dist
+            })
 
-    return successful_matches_detail, sorted(list(areas_to_analyze_indexed)), debug_info
+    return successful_matches_detail, sorted(list(areas_to_analyze_indexed)), debug_info, sorted(list(dynamic_stopwords))
+
 
 def parse_json_response(response_text: str):
     try:

@@ -24,3 +24,7 @@ venv/
 
 # Optional: Un-ignore requirements.txt (Highly recommended to track this too)
 !requirements.txt
+supportdata.zip
+test_output.docx
+logs/pb-app_tokens.log
+logs/pb-app.log
